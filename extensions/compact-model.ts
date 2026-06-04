@@ -16,9 +16,8 @@
  *   Format: { "provider": "google", "model": "gemini-2.5-flash" }
  *
  * Command:
- * - /compact-model         show the currently effective model and its source
- * - /compact-model status  same as above
- * - /compact-model set     pick a model and choose where to save it
+ * - /compact-model opens a settings-style menu.
+ *   Enter/Space changes the selected setting; Esc exits without further changes.
  *
  * On any failure (no config, model not found, no auth, LLM error, aborted/error
  * result, or unexpected exception) the extension returns undefined so pi falls
@@ -32,11 +31,20 @@ import path from "node:path";
 import {
 	compact,
 	generateBranchSummary,
+	getSelectListTheme,
+	getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+	SelectList,
+	SettingsList,
+	type Component,
+	type SelectItem,
+	type SettingItem,
+} from "@earendil-works/pi-tui";
 
 const CONFIG_FILENAME = "compact-model.json";
 
@@ -61,6 +69,10 @@ function projectConfigPath(cwd: string): string {
 
 function globalConfigPath(): string {
 	return path.join(os.homedir(), ".pi", "agent", CONFIG_FILENAME);
+}
+
+function configPathForScope(scope: ConfigSource, cwd: string): string {
+	return scope === "project" ? projectConfigPath(cwd) : globalConfigPath();
 }
 
 /** Read and validate one config file. Returns undefined if missing or invalid. */
@@ -105,14 +117,22 @@ function writeConfig(
 	cwd: string,
 	cfg: CompactModelConfig,
 ): string | undefined {
-	const file =
-		scope === "project" ? projectConfigPath(cwd) : globalConfigPath();
+	const file = configPathForScope(scope, cwd);
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
 		return file;
 	} catch {
 		return undefined;
+	}
+}
+
+function clearConfig(scope: ConfigSource, cwd: string): boolean {
+	try {
+		fs.rmSync(configPathForScope(scope, cwd), { force: true });
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -274,79 +294,148 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- Command: /compact-model [status|set] ---
+	// --- Command: /compact-model ---
 	pi.registerCommand("compact-model", {
-		description:
-			"Show or set the model used for compaction and branch summaries",
-		getArgumentCompletions: (prefix) => {
-			const items = [
-				{ value: "status", label: "status — show current compaction model" },
-				{ value: "set", label: "set — pick a model and save scope" },
-			];
-			const filtered = items.filter((i) => i.value.startsWith(prefix));
-			return filtered.length > 0 ? filtered : null;
-		},
-		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-
-			// status (default): show current effective config, do not enter selection
-			if (arg === "" || arg === "status") {
-				const cfg = resolveConfig(ctx.cwd);
-				if (!cfg) {
-					ctx.ui.notify(
-						"compact-model: not configured — using pi default compaction. Run /compact-model set to choose a model.",
-						"info",
-					);
-					return;
-				}
-				ctx.ui.notify(
-					`compact-model: ${modelLabel(cfg.provider, cfg.model)} (${cfg.source})`,
-					"info",
-				);
-				return;
-			}
-
-			// set: interactive selection
+		description: "Configure the model used for compaction and branch summaries",
+		handler: async (_args, ctx) => {
+			const defaultValue = "pi default";
 			const available = ctx.modelRegistry.getAvailable();
-			if (available.length === 0) {
-				ctx.ui.notify(
-					"compact-model: no models with configured auth are available",
-					"warning",
+			const modelOptions: SelectItem[] = [
+				{
+					value: defaultValue,
+					label: defaultValue,
+					description: "Clear this scope and let pi choose the default compaction behavior",
+				},
+				...available.map((m) => ({
+					value: modelLabel(m.provider, m.id),
+					label: modelLabel(m.provider, m.id),
+					description: m.name,
+				})),
+			];
+
+			const readScopedLabel = (scope: ConfigSource): string => {
+				const file = configPathForScope(scope, ctx.cwd);
+				const cfg = readConfigFile(file);
+				return cfg ? modelLabel(cfg.provider, cfg.model) : defaultValue;
+			};
+			const effectiveLabel = (): string => {
+				const cfg = resolveConfig(ctx.cwd);
+				return cfg ? `${modelLabel(cfg.provider, cfg.model)} (${cfg.source})` : defaultValue;
+			};
+
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				let settingsList: SettingsList;
+
+				const makeModelSubmenu = (
+					scope: ConfigSource,
+					currentValue: string,
+					doneSubmenu: (selectedValue?: string) => void,
+				): Component => {
+					const selectList = new SelectList(
+						modelOptions,
+						Math.min(modelOptions.length, 12),
+						getSelectListTheme(),
+					);
+					const currentIndex = modelOptions.findIndex((o) => o.value === currentValue);
+					if (currentIndex >= 0) selectList.setSelectedIndex(currentIndex);
+					selectList.onSelect = (item) => doneSubmenu(item.value);
+					selectList.onCancel = () => doneSubmenu();
+					return {
+						render(width: number) {
+							return [
+								theme.bold(theme.fg("accent", `${scope === "project" ? "Project" : "Global"} compaction model`)),
+								"",
+								...selectList.render(width),
+								"",
+								theme.fg("dim", "  Enter to select · Esc to go back"),
+							];
+						},
+						handleInput(data: string) {
+							selectList.handleInput(data);
+							tui.requestRender();
+						},
+						invalidate() {
+							selectList.invalidate();
+						},
+					};
+				};
+
+				const items: SettingItem[] = [
+					{
+						id: "effective",
+						label: "Effective model",
+						description: "Current model used by compaction. Project config overrides global config.",
+						currentValue: effectiveLabel(),
+					},
+					{
+						id: "project",
+						label: "Project model",
+						description: "Saved in .pi/compact-model.json. Enter/Space to change; choose pi default to clear.",
+						currentValue: readScopedLabel("project"),
+						submenu: (currentValue, doneSubmenu) => makeModelSubmenu("project", currentValue, doneSubmenu),
+					},
+					{
+						id: "global",
+						label: "Global model",
+						description: "Saved in ~/.pi/agent/compact-model.json. Enter/Space to change; choose pi default to clear.",
+						currentValue: readScopedLabel("global"),
+						submenu: (currentValue, doneSubmenu) => makeModelSubmenu("global", currentValue, doneSubmenu),
+					},
+				];
+
+				settingsList = new SettingsList(
+					items,
+					Math.min(items.length, 10),
+					getSettingsListTheme(),
+					(id, newValue) => {
+						if (id !== "project" && id !== "global") return;
+						const scope = id as ConfigSource;
+						const previousValue = readScopedLabel(scope);
+						if (newValue === defaultValue) {
+							if (!clearConfig(scope, ctx.cwd)) {
+								ctx.ui.notify(`compact-model: failed to clear ${scope} config`, "error");
+								settingsList.updateValue(scope, previousValue);
+								return;
+							}
+						} else {
+							const chosen = available.find((m) => modelLabel(m.provider, m.id) === newValue);
+							if (!chosen) {
+								ctx.ui.notify(`compact-model: model ${newValue} is no longer available`, "warning");
+								settingsList.updateValue(scope, previousValue);
+								return;
+							}
+							const written = writeConfig(scope, ctx.cwd, {
+								provider: chosen.provider,
+								model: chosen.id,
+							});
+							if (!written) {
+								ctx.ui.notify(`compact-model: failed to write ${scope} config`, "error");
+								settingsList.updateValue(scope, previousValue);
+								return;
+							}
+						}
+						settingsList.updateValue("effective", effectiveLabel());
+					},
+					() => done(),
 				);
-				return;
-			}
 
-			const labels = available.map((m) => modelLabel(m.provider, m.id));
-			const picked = await ctx.ui.select("Select compaction model", labels);
-			if (!picked) return; // cancelled
-
-			const chosen = available[labels.indexOf(picked)];
-			if (!chosen) return;
-
-			const scopeChoice = await ctx.ui.select("Save where?", [
-				"Project (.pi/compact-model.json)",
-				"Global (~/.pi/agent/compact-model.json)",
-			]);
-			if (!scopeChoice) return; // cancelled
-
-			const scope: ConfigSource = scopeChoice.startsWith("Project")
-				? "project"
-				: "global";
-			const written = writeConfig(scope, ctx.cwd, {
-				provider: chosen.provider,
-				model: chosen.id,
+				return {
+					render(width: number) {
+						return [
+							theme.bold(theme.fg("accent", "Compact Model Configuration")),
+							"",
+							...settingsList.render(width),
+						];
+					},
+					handleInput(data: string) {
+						settingsList.handleInput(data);
+						tui.requestRender();
+					},
+					invalidate() {
+						settingsList.invalidate();
+					},
+				};
 			});
-			if (!written) {
-				ctx.ui.notify(
-					`compact-model: failed to write ${scope} config`,
-					"error",
-				);
-				return;
-			}
-			ctx.ui.notify(
-				`compact-model: saved ${modelLabel(chosen.provider, chosen.id)} to ${scope} (${written})`,
-				"info",
-			);
 		},
 	});
 }

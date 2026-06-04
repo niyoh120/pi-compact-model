@@ -24,22 +24,19 @@ pi -e ./extensions/compact-model.ts
 
 ## Usage
 
-Pick a model and where to save it:
-
-```
-/compact-model set
-```
-
-You will be asked to:
-1. choose a model from those that have configured auth
-2. choose where to save: project (`.pi/compact-model.json`) or global (`~/.pi/agent/compact-model.json`)
-
-Show the currently effective model and its source:
+Open the settings-style menu:
 
 ```
 /compact-model
-/compact-model status
 ```
+
+The menu shows:
+
+- `Effective model` — read-only; project config overrides global config
+- `Project model` — saved in `.pi/compact-model.json`
+- `Global model` — saved in `~/.pi/agent/compact-model.json`
+
+Use Enter/Space to change the selected setting. Choose `pi default` to clear that scope. Press Esc to exit.
 
 ## Configuration
 
