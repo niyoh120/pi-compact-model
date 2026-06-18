@@ -30,6 +30,7 @@ import path from "node:path";
 
 import {
 	compact,
+	DEFAULT_COMPACTION_SETTINGS,
 	generateBranchSummary,
 	getSelectListTheme,
 	getSettingsListTheme,
@@ -47,6 +48,14 @@ import {
 } from "@earendil-works/pi-tui";
 
 const CONFIG_FILENAME = "compact-model.json";
+const SETTINGS_FILENAME = "settings.json";
+const MIN_AUTO_COMPACTION_INTERVAL_MS = 60_000;
+
+const AUTO_CONTINUE_PROMPT =
+	"Continue the task that was interrupted by automatic compaction. First recover progress from the compaction summary and recent context, then perform only the necessary next step while avoiding completed work.";
+
+const AUTO_COMPACT_INSTRUCTIONS =
+	"This compaction was triggered automatically mid-task. Preserve the active task, completed steps, pending steps, current tool results, files read/modified, errors, blockers, and the exact next action so work can continue without repeating completed work.";
 
 type ConfigSource = "project" | "global";
 
@@ -62,6 +71,8 @@ interface ResolvedConfig extends CompactModelConfig {
 /** Reentrancy guard: prevents re-entering our handlers if pi's compact()/
  * generateBranchSummary() were ever to re-trigger the same events. */
 let inCompaction = false;
+let autoCompacting = false;
+let lastAutoCompactionAt = 0;
 
 function projectConfigPath(cwd: string): string {
 	return path.join(cwd, ".pi", CONFIG_FILENAME);
@@ -69,6 +80,14 @@ function projectConfigPath(cwd: string): string {
 
 function globalConfigPath(): string {
 	return path.join(os.homedir(), ".pi", "agent", CONFIG_FILENAME);
+}
+
+function projectSettingsPath(cwd: string): string {
+	return path.join(cwd, ".pi", SETTINGS_FILENAME);
+}
+
+function globalSettingsPath(): string {
+	return path.join(os.homedir(), ".pi", "agent", SETTINGS_FILENAME);
 }
 
 function configPathForScope(scope: ConfigSource, cwd: string): string {
@@ -136,6 +155,49 @@ function clearConfig(scope: ConfigSource, cwd: string): boolean {
 	}
 }
 
+interface AutoCompactionSettings {
+	enabled: boolean;
+	reserveTokens: number;
+}
+
+function readJsonObject(file: string): Record<string, unknown> | undefined {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+		return parsed && typeof parsed === "object"
+			? (parsed as Record<string, unknown>)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function compactionSettingsFrom(
+	settings: Record<string, unknown> | undefined,
+): Partial<AutoCompactionSettings> {
+	const compaction = settings?.compaction;
+	if (!compaction || typeof compaction !== "object") return {};
+	const input = compaction as Record<string, unknown>;
+	const result: Partial<AutoCompactionSettings> = {};
+	if (typeof input.enabled === "boolean") result.enabled = input.enabled;
+	if (
+		typeof input.reserveTokens === "number" &&
+		Number.isFinite(input.reserveTokens) &&
+		input.reserveTokens > 0
+	) {
+		result.reserveTokens = input.reserveTokens;
+	}
+	return result;
+}
+
+function resolveAutoCompactionSettings(cwd: string): AutoCompactionSettings {
+	return {
+		enabled: DEFAULT_COMPACTION_SETTINGS.enabled,
+		reserveTokens: DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+		...compactionSettingsFrom(readJsonObject(globalSettingsPath())),
+		...compactionSettingsFrom(readJsonObject(projectSettingsPath(cwd))),
+	};
+}
+
 type ResolvedModelAuth = {
 	model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>;
 	apiKey: string;
@@ -180,7 +242,79 @@ function modelLabel(provider: string, id: string): string {
 	return `${provider}/${id}`;
 }
 
+function shouldAutoCompact(ctx: ExtensionContext, now = Date.now()): boolean {
+	if (autoCompacting || inCompaction || !ctx.model) return false;
+	if (now - lastAutoCompactionAt < MIN_AUTO_COMPACTION_INTERVAL_MS) return false;
+
+	const settings = resolveAutoCompactionSettings(ctx.cwd);
+	if (!settings.enabled) return false;
+
+	const usage = ctx.getContextUsage();
+	if (!usage || usage.tokens === null || usage.contextWindow <= 0) return false;
+
+	return usage.tokens > usage.contextWindow - settings.reserveTokens;
+}
+
 export default function (pi: ExtensionAPI) {
+	pi.on("turn_end", (event, ctx) => {
+		// Only interrupt when another model turn would follow this tool batch.
+		if (event.toolResults.length === 0 || !shouldAutoCompact(ctx)) return;
+
+		// shouldAutoCompact already validated usage; re-read for display.
+		const usage = ctx.getContextUsage();
+		if (!usage || usage.tokens === null) return;
+
+		autoCompacting = true;
+		ctx.ui.notify(
+			`compact-model: auto-compacting at ${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens`,
+			"info",
+		);
+
+		try {
+			ctx.compact({
+				customInstructions: AUTO_COMPACT_INSTRUCTIONS,
+				onComplete: () => {
+					autoCompacting = false;
+					lastAutoCompactionAt = Date.now();
+					ctx.ui.notify(
+						"compact-model: auto-compaction complete, continuing",
+						"info",
+					);
+					void Promise.resolve()
+						.then(() =>
+							pi.sendUserMessage(
+								AUTO_CONTINUE_PROMPT,
+								ctx.isIdle() ? undefined : { deliverAs: "followUp" },
+							),
+						)
+						.catch((err: unknown) => {
+							const msg = err instanceof Error ? err.message : String(err);
+							ctx.ui.notify(
+								`compact-model: failed to continue after compaction (${msg})`,
+								"warning",
+							);
+						});
+				},
+				onError: (error) => {
+					autoCompacting = false;
+					lastAutoCompactionAt = Date.now();
+					ctx.ui.notify(
+						`compact-model: auto-compaction failed (${error.message})`,
+						"warning",
+					);
+				},
+			});
+		} catch (err) {
+			autoCompacting = false;
+			lastAutoCompactionAt = Date.now();
+			const msg = err instanceof Error ? err.message : String(err);
+			ctx.ui.notify(
+				`compact-model: failed to start auto-compaction (${msg})`,
+				"warning",
+			);
+		}
+	});
+
 	// --- Compaction: auto-compaction and /compact ---
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (inCompaction) return undefined;
@@ -304,7 +438,8 @@ export default function (pi: ExtensionAPI) {
 				{
 					value: defaultValue,
 					label: defaultValue,
-					description: "Clear this scope and let pi choose the default compaction behavior",
+					description:
+						"Clear this scope and let pi choose the default compaction behavior",
 				},
 				...available.map((m) => ({
 					value: modelLabel(m.provider, m.id),
@@ -320,7 +455,9 @@ export default function (pi: ExtensionAPI) {
 			};
 			const effectiveLabel = (): string => {
 				const cfg = resolveConfig(ctx.cwd);
-				return cfg ? `${modelLabel(cfg.provider, cfg.model)} (${cfg.source})` : defaultValue;
+				return cfg
+					? `${modelLabel(cfg.provider, cfg.model)} (${cfg.source})`
+					: defaultValue;
 			};
 
 			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
@@ -336,14 +473,21 @@ export default function (pi: ExtensionAPI) {
 						Math.min(modelOptions.length, 12),
 						getSelectListTheme(),
 					);
-					const currentIndex = modelOptions.findIndex((o) => o.value === currentValue);
+					const currentIndex = modelOptions.findIndex(
+						(o) => o.value === currentValue,
+					);
 					if (currentIndex >= 0) selectList.setSelectedIndex(currentIndex);
 					selectList.onSelect = (item) => doneSubmenu(item.value);
 					selectList.onCancel = () => doneSubmenu();
 					return {
 						render(width: number) {
 							return [
-								theme.bold(theme.fg("accent", `${scope === "project" ? "Project" : "Global"} compaction model`)),
+								theme.bold(
+									theme.fg(
+										"accent",
+										`${scope === "project" ? "Project" : "Global"} compaction model`,
+									),
+								),
 								"",
 								...selectList.render(width),
 								"",
@@ -364,22 +508,27 @@ export default function (pi: ExtensionAPI) {
 					{
 						id: "effective",
 						label: "Effective model",
-						description: "Current model used by compaction. Project config overrides global config.",
+						description:
+							"Current model used by compaction. Project config overrides global config.",
 						currentValue: effectiveLabel(),
 					},
 					{
 						id: "project",
 						label: "Project model",
-						description: "Saved in .pi/compact-model.json. Enter/Space to change; choose pi default to clear.",
+						description:
+							"Saved in .pi/compact-model.json. Enter/Space to change; choose pi default to clear.",
 						currentValue: readScopedLabel("project"),
-						submenu: (currentValue, doneSubmenu) => makeModelSubmenu("project", currentValue, doneSubmenu),
+						submenu: (currentValue, doneSubmenu) =>
+							makeModelSubmenu("project", currentValue, doneSubmenu),
 					},
 					{
 						id: "global",
 						label: "Global model",
-						description: "Saved in ~/.pi/agent/compact-model.json. Enter/Space to change; choose pi default to clear.",
+						description:
+							"Saved in ~/.pi/agent/compact-model.json. Enter/Space to change; choose pi default to clear.",
 						currentValue: readScopedLabel("global"),
-						submenu: (currentValue, doneSubmenu) => makeModelSubmenu("global", currentValue, doneSubmenu),
+						submenu: (currentValue, doneSubmenu) =>
+							makeModelSubmenu("global", currentValue, doneSubmenu),
 					},
 				];
 
@@ -393,14 +542,22 @@ export default function (pi: ExtensionAPI) {
 						const previousValue = readScopedLabel(scope);
 						if (newValue === defaultValue) {
 							if (!clearConfig(scope, ctx.cwd)) {
-								ctx.ui.notify(`compact-model: failed to clear ${scope} config`, "error");
+								ctx.ui.notify(
+									`compact-model: failed to clear ${scope} config`,
+									"error",
+								);
 								settingsList.updateValue(scope, previousValue);
 								return;
 							}
 						} else {
-							const chosen = available.find((m) => modelLabel(m.provider, m.id) === newValue);
+							const chosen = available.find(
+								(m) => modelLabel(m.provider, m.id) === newValue,
+							);
 							if (!chosen) {
-								ctx.ui.notify(`compact-model: model ${newValue} is no longer available`, "warning");
+								ctx.ui.notify(
+									`compact-model: model ${newValue} is no longer available`,
+									"warning",
+								);
 								settingsList.updateValue(scope, previousValue);
 								return;
 							}
@@ -409,7 +566,10 @@ export default function (pi: ExtensionAPI) {
 								model: chosen.id,
 							});
 							if (!written) {
-								ctx.ui.notify(`compact-model: failed to write ${scope} config`, "error");
+								ctx.ui.notify(
+									`compact-model: failed to write ${scope} config`,
+									"error",
+								);
 								settingsList.updateValue(scope, previousValue);
 								return;
 							}
